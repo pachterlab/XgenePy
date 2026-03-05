@@ -1,6 +1,6 @@
 # XgenePy
 
-`XgenePy` is a Python port of the `XgeneR` package for modeling cis and trans
+`XgenePy` is a Python port of the [`XgeneR`](https://github.com/pachterlab/XgeneR) package for modeling cis and trans
 regulatory differences between homozygous strains. It mirrors the core `XgeneR`
 workflow while replacing the R [`edgeR`](https://bioconductor.org/packages/release/bioc/html/edgeR.html) dependency with the Python
 [`edgePython`](https://github.com/pachterlab/edgePython) package.
