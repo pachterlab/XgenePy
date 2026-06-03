@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from .model import FitObject
+from .model import FitObject, get_regulatory_weights
 
 
 @dataclass
@@ -87,17 +87,10 @@ def _combo_projection_matrix(
 
     if combo is None:
         combo_x[:, 0] = 1.0
-        combo_x[1, 1] = 1.0
-        combo_x[3, 1] = 1.0
-
-        if fit_object.trans_model == "log_additive":
-            combo_x[0, 2] = 1.0
-            combo_x[2, 2] = 0.5
-            combo_x[3, 2] = 0.5
-        else:
-            combo_x[0, 2] = 1.0
-            combo_x[2, 2] = 1.0
-            combo_x[3, 2] = 1.0
+        regulatory_weights = get_regulatory_weights(["P1", "P2", "H1", "H2"], fit_object.trans_model)
+        for column_name in regulatory_weights.columns:
+            if column_name in weight_names:
+                combo_x[:, weight_names.index(column_name)] = regulatory_weights[column_name].to_numpy(dtype=float)
         return combo_x, fdrs_no_cis, fdrs_no_trans
 
     fields = fit_object.fields_to_test or []
@@ -108,26 +101,24 @@ def _combo_projection_matrix(
     all_fields = [item for values in unique_categories.values() for item in values]
     combo_split = set(combo.split(interaction_designator))
     bad_fields = [field for field in all_fields if field not in combo_split]
+    regulatory_weights = get_regulatory_weights(["P1", "P2", "H1", "H2"], fit_object.trans_model)
 
     for index, weight in enumerate(weight_names):
         keep = not any(bad_field in weight for bad_field in bad_fields)
         cis = keep and "beta_cis" in weight
         trans = keep and "beta_trans" in weight
+        hybrid = keep and "beta_hybrid" in weight
 
         if cis:
-            combo_x[1, index] = 1.0
-            combo_x[3, index] = 1.0
+            combo_x[:, index] = regulatory_weights["beta_cis"].to_numpy(dtype=float)
 
         if trans:
-            combo_x[0, index] = 1.0
-            if fit_object.trans_model == "log_additive":
-                combo_x[2, index] = 0.5
-                combo_x[3, index] = max(combo_x[3, index], 0.5)
-            else:
-                combo_x[2, index] = 1.0
-                combo_x[3, index] = 1.0
+            combo_x[:, index] = regulatory_weights["beta_trans"].to_numpy(dtype=float)
 
-        if keep and not cis and not trans:
+        if hybrid:
+            combo_x[:, index] = regulatory_weights["beta_hybrid"].to_numpy(dtype=float)
+
+        if keep and not cis and not trans and not hybrid:
             combo_x[:, index] = 1.0
 
     return combo_x, fdrs_no_cis, fdrs_no_trans
@@ -202,7 +193,7 @@ def get_assignments_and_plot(
     df.loc[cis_plus_trans_index, "reg_assignment"] = "cis+trans"
     df.loc[cis_x_trans_index, "reg_assignment"] = "cisxtrans"
 
-    theta_scaled = (2.0 / np.pi) * np.arctan2(h_values, delta)
+    theta_scaled = (2.0 / np.pi) * np.arctan(h_values / delta)
     radius = np.sqrt((delta ** 2) + (h_values ** 2))
     cis_prop_reordered = theta_scaled - 0.5
     cis_prop_reordered = np.where(cis_prop_reordered > 1.0, cis_prop_reordered - 2.0, cis_prop_reordered)

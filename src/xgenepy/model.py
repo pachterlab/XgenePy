@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from edgepython import calc_norm_factors, estimate_disp, glm_fit, glm_lrt, make_dgelist
+from statsmodels.stats.multitest import multipletests
 
 
 INTERACTION_DESIGNATOR = "*"
@@ -105,26 +106,21 @@ def _build_design_matrix(
     if "Allele" not in metadata_reformatted.columns:
         raise ValueError("Reformatted metadata must include an 'Allele' column.")
 
-    allele = metadata_reformatted["Allele"]
-    p1 = allele.eq("P1").to_numpy()
-    p2 = allele.eq("P2").to_numpy()
-    h1 = allele.eq("H1").to_numpy()
-    h2 = allele.eq("H2").to_numpy()
-
     n_samples = len(metadata_reformatted)
     design_columns: list[np.ndarray] = [np.ones(n_samples, dtype=float)]
     weight_names = ["Intercept"]
 
-    beta_cis = (p2 | h2).astype(float)
-    if trans_model == "log_additive":
-        beta_trans = np.where(p1, 1.0, np.where(h1 | h2, 0.5, 0.0))
-    elif trans_model == "dominant":
-        beta_trans = (p1 | h1 | h2).astype(float)
-    else:
-        raise ValueError("trans_model must be either 'log_additive' or 'dominant'.")
+    regulatory_weights = get_regulatory_weights(metadata_reformatted["Allele"], trans_model)
+    beta_cis = regulatory_weights["beta_cis"].to_numpy(dtype=float)
+    beta_trans = regulatory_weights["beta_trans"].to_numpy(dtype=float)
 
     design_columns.extend([beta_cis, beta_trans])
     weight_names.extend(["beta_cis", "beta_trans"])
+
+    if trans_model == "free":
+        beta_hybrid = regulatory_weights["beta_hybrid"].to_numpy(dtype=float)
+        design_columns.append(beta_hybrid)
+        weight_names.append("beta_hybrid")
 
     if not _as_list(fields_to_test) and _as_list(covariate_cols):
         covariate_matrix = metadata_reformatted.drop(columns=["Allele"])
@@ -140,18 +136,16 @@ def _build_design_matrix(
                 for cond in conds:
                     cond_filt &= metadata_reformatted[cond].to_numpy(dtype=bool)
                 name = interact_designator.join(conds)
-                beta_cis_cond = ((p2 | h2) & cond_filt).astype(float)
-                if trans_model == "log_additive":
-                    beta_trans_cond = np.where(
-                        p1 & cond_filt,
-                        1.0,
-                        np.where((h1 | h2) & cond_filt, 0.5, 0.0),
-                    )
-                else:
-                    beta_trans_cond = ((p1 | h1 | h2) & cond_filt).astype(float)
+                cond_values = cond_filt.astype(float)
+                beta_cis_cond = beta_cis * cond_values
+                beta_trans_cond = beta_trans * cond_values
 
                 design_columns.extend([beta_cis_cond, beta_trans_cond])
                 weight_names.extend([f"beta_cis*{name}", f"beta_trans*{name}"])
+
+                if trans_model == "free":
+                    design_columns.append(beta_hybrid * cond_values)
+                    weight_names.append(f"beta_hybrid*{name}")
             else:
                 conds = des.split(interact_designator)
                 cond_filt = np.ones(n_samples, dtype=bool)
@@ -165,15 +159,47 @@ def _build_design_matrix(
     return pd.DataFrame(matrix, index=metadata_reformatted.index, columns=weight_names)
 
 
+def get_regulatory_weights(allele: pd.Series | list[str] | np.ndarray, trans_model: str) -> pd.DataFrame:
+    allele_series = pd.Series(allele, dtype=str)
+    p1 = allele_series.eq("P1").to_numpy()
+    p2 = allele_series.eq("P2").to_numpy()
+    h1 = allele_series.eq("H1").to_numpy()
+    h2 = allele_series.eq("H2").to_numpy()
+
+    valid_models = {"log_additive", "dominant", "free"}
+    if trans_model not in valid_models:
+        raise ValueError("trans_model must be one of: log_additive, dominant, free.")
+
+    weights = pd.DataFrame(index=allele_series.index)
+    weights["beta_cis"] = np.nan
+    weights["beta_trans"] = np.nan
+
+    weights.loc[p1 | h1, "beta_cis"] = -0.5
+    weights.loc[p2 | h2, "beta_cis"] = 0.5
+
+    weights.loc[p1, "beta_trans"] = -0.5
+    weights.loc[p2, "beta_trans"] = 0.5
+
+    if trans_model in {"log_additive", "free"}:
+        weights.loc[h1 | h2, "beta_trans"] = 0.0
+    else:
+        weights.loc[h1 | h2, "beta_trans"] = 0.5
+
+    if trans_model == "free":
+        weights["beta_hybrid"] = (h1 | h2).astype(float)
+
+    if weights.isna().any(axis=None):
+        raise ValueError("Allele must contain only P1, P2, H1, or H2.")
+
+    return weights.astype(float)
+
+
 def get_fdrs(pvals: pd.Series | np.ndarray | list[float]) -> np.ndarray:
     pvals_arr = np.asarray(pvals, dtype=float)
-    num_test = len(pvals_arr)
-    order_idx = np.argsort(pvals_arr)
-    sorted_p = pvals_arr[order_idx]
-    fdr_sorted = (np.arange(1, num_test + 1, dtype=float) / float(num_test)) * sorted_p
-    fdr_sorted = np.minimum.accumulate(fdr_sorted[::-1])[::-1]
-    fdr = np.empty(num_test, dtype=float)
-    fdr[order_idx] = fdr_sorted
+    fdr = np.full(len(pvals_arr), np.nan, dtype=float)
+    finite = np.isfinite(pvals_arr)
+    if finite.any():
+        fdr[finite] = multipletests(pvals_arr[finite], method="fdr_bh")[1]
     return fdr
 
 
@@ -181,7 +207,7 @@ def get_fdrs(pvals: pd.Series | np.ndarray | list[float]) -> np.ndarray:
 class FitObject:
     counts: pd.DataFrame
     metadata: pd.DataFrame
-    trans_model: str = "log_additive"
+    trans_model: str = "free"
     covariate_cols: list[str] | None = None
     fields_to_test: list[str] | None = None
     ref: dict[str, str] | None = None
@@ -248,21 +274,26 @@ def _normalize_coef_indices(indices: np.ndarray, n_coef: int) -> list[int]:
     return (indices.astype(int) - 1).tolist()
 
 
-def fit_edgepython(object: FitObject, test: dict[str, np.ndarray | list[float] | list[int]] | None = None) -> FitObject:
+def fit_edgepython(
+    object: FitObject,
+    test: dict[str, np.ndarray | list[float] | list[int]] | None = None,
+    dispersion_design: bool = True,
+) -> FitObject:
     gene_names = object.counts.index.to_list()
     dge = make_dgelist(object.counts)
     dge = calc_norm_factors(dge)
-    dge = estimate_disp(dge, design=None)
+    dispersion_matrix = object.design_matrix_full.to_numpy(dtype=float) if dispersion_design else None
+    dge = estimate_disp(dge, design=dispersion_matrix)
     fit = glm_fit(dge, design=object.design_matrix_full.to_numpy(dtype=float), dispersion=dge.get("tagwise.dispersion"))
 
     weight_names = object.design_matrix_full.columns.to_list()
     n_coef = len(weight_names)
-    cis_coef_idx = np.array([i for i, name in enumerate(weight_names) if "cis" in name], dtype=int)
-    trans_coef_idx = np.array([i for i, name in enumerate(weight_names) if "trans" in name], dtype=int)
+    cis_coef_idx = np.array([i for i, name in enumerate(weight_names) if name == "beta_cis"], dtype=int)
+    trans_coef_idx = np.array([i for i, name in enumerate(weight_names) if name == "beta_trans"], dtype=int)
     if cis_coef_idx.size == 0:
-        raise ValueError("No coefficient names contain 'cis'; cannot run default cis test.")
+        raise ValueError("No coefficient named 'beta_cis'; cannot run default cis test.")
     if trans_coef_idx.size == 0:
-        raise ValueError("No coefficient names contain 'trans'; cannot run default trans test.")
+        raise ValueError("No coefficient named 'beta_trans'; cannot run default trans test.")
 
     if test is not None:
         if not isinstance(test, dict) or any(not key for key in test):
@@ -271,36 +302,16 @@ def fit_edgepython(object: FitObject, test: dict[str, np.ndarray | list[float] |
     raw_pval_dict: dict[str, Any] = {"Genes": gene_names}
     fdr_dict: dict[str, Any] = {"Genes": gene_names}
 
-    default_tests: list[tuple[str, np.ndarray]] = [
-        ("null: no cis", cis_coef_idx),
-        ("null: no trans", trans_coef_idx),
-    ]
-    for test_name, coef_idx in default_tests:
-        lrt = glm_lrt(fit, coef=coef_idx.tolist())
-        pvals = lrt["table"]["PValue"].to_numpy(dtype=float)
-        raw_pval_dict[test_name] = pvals
-        fdr_dict[test_name] = get_fdrs(pvals)
-
-    if _as_list(object.fields_to_test):
-        for field_name in _as_list(object.fields_to_test):
-            field_tag = field_name.lower()
-            cis_prefix = f"beta_cis*{field_tag}-"
-            trans_prefix = f"beta_trans*{field_tag}-"
-            cis_field_idx = np.array([i for i, name in enumerate(weight_names) if name.startswith(cis_prefix)], dtype=int)
-            trans_field_idx = np.array([i for i, name in enumerate(weight_names) if name.startswith(trans_prefix)], dtype=int)
-
-            if cis_field_idx.size > 0:
-                lrt = glm_lrt(fit, coef=cis_field_idx.tolist())
-                pvals = lrt["table"]["PValue"].to_numpy(dtype=float)
-                key = f"null: no {field_name} cis"
-                raw_pval_dict[key] = pvals
-                fdr_dict[key] = get_fdrs(pvals)
-            if trans_field_idx.size > 0:
-                lrt = glm_lrt(fit, coef=trans_field_idx.tolist())
-                pvals = lrt["table"]["PValue"].to_numpy(dtype=float)
-                key = f"null: no {field_name} trans"
-                raw_pval_dict[key] = pvals
-                fdr_dict[key] = get_fdrs(pvals)
+    if not _as_list(object.fields_to_test):
+        default_tests: list[tuple[str, np.ndarray]] = [
+            ("null: no cis", cis_coef_idx),
+            ("null: no trans", trans_coef_idx),
+        ]
+        for test_name, coef_idx in default_tests:
+            lrt = glm_lrt(fit, coef=coef_idx.tolist())
+            pvals = lrt["table"]["PValue"].to_numpy(dtype=float)
+            raw_pval_dict[test_name] = pvals
+            fdr_dict[test_name] = get_fdrs(pvals)
 
     if test is not None:
         for test_name, test_vector in test.items():
